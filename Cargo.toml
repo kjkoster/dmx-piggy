@@ -1,0 +1,17 @@
+[package]
+name = "dmx-piggy"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT"
+description = "no_std, no_alloc driver for the Flying Pig Systems / High End USB DMX Widget Mk3 (Cypress EZ-USB AN2131). Bring-your-own-firmware."
+repository = "https://github.com/kjkoster/dmx-piggy"
+readme = "README.md"
+keywords = ["dmx", "usb", "ez-usb", "embassy", "lighting"]
+categories = ["embedded", "no-std", "hardware-support"]
+
+# The driver is transport-agnostic: it implements the widget's protocol only and
+# depends on no USB host stack, so it carries no runtime dependencies.
+[dependencies]
+
+[dev-dependencies]

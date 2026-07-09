@@ -1,0 +1,31 @@
+# Detached from the library's build graph: this example pulls in a USB host
+# stack and an async runtime that have no business in `cargo test` at the root.
+[workspace]
+
+[package]
+name = "piggy-embassy-dmx"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[dependencies]
+dmx-piggy = { path = "../.." }
+
+# Runs in Linux user space — e.g. Raspberry Pi OS on a Pi 3B. Embassy's `std`
+# arch runs the very same async driver code that a bare-metal target would, and
+# `nusb` is the (pure-Rust, async) USB host stack. Versions known-good at the
+# time of writing; expect to bump these and adjust feature names to match.
+# `integrated-timers` makes the executor provide embassy-time's timer-queue hook
+# (`_embassy_time_schedule_wake`); the `std` feature below provides the clock.
+embassy-executor = { version = "0.6", features = ["arch-std", "executor-thread", "log", "integrated-timers"] }
+embassy-time = { version = "0.3", features = ["std"] }
+nusb = "0.2"
+static_cell = "2"
+log = "0.4"
+env_logger = "0.11"
+anyhow = "1"
+
+[profile.release]
+lto = true
+opt-level = "s"

@@ -1,0 +1,10 @@
+/target
+**/target
+Cargo.lock
+**/*.rs.bk
+
+# Never commit firmware images: they are third-party copyrighted work and are
+# supplied by the user at build time, not vendored here.
+*.bin
+*.hex
+hesf*

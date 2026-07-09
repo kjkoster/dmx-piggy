@@ -1,0 +1,4 @@
+[toolchain]
+channel = "stable"
+# The library needs 1.75+ (async fn in traits). The Pico example additionally
+# needs the bare-metal target: `rustup target add thumbv6m-none-eabi`.

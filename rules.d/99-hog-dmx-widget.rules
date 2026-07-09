@@ -1,0 +1,17 @@
+# udev rules for the High End / Flying Pig Systems USB DMX Widget.
+#
+# Without these, only root can open the device and the driver fails with
+# "permission denied (errno 13)". Both product IDs are needed: the widget
+# enumerates as the bootloader (0x0001), then re-enumerates as the loaded
+# product (0x0002) after firmware upload, and the driver must open both.
+#
+# Install:
+#   sudo cp rules.d/99-hog-dmx-widget.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+# then unplug and replug the widget.
+#
+# MODE="0666" lets any local user open the device (simplest for a personal host).
+# To restrict instead, use MODE="0660", GROUP="plugdev" and add your user to the
+# plugdev group.
+SUBSYSTEM=="usb", ATTR{idVendor}=="0cb0", ATTR{idProduct}=="0001", MODE="0666"
+SUBSYSTEM=="usb", ATTR{idVendor}=="0cb0", ATTR{idProduct}=="0002", MODE="0666"
