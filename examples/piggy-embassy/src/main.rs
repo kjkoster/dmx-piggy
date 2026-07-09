@@ -22,9 +22,9 @@ use nusb::transfer::{Buffer, Bulk, ControlIn, ControlOut, ControlType, Out, Reci
 use nusb::MaybeFuture;
 use static_cell::StaticCell;
 
-/// DMX wants a steady refresh even when nothing changes; 25 ms (~40 Hz) is a
-/// common, comfortably compliant rate.
-const REFRESH: Duration = Duration::from_millis(25);
+/// DMX wants a steady refresh even when nothing changes. ~44 Hz is the fastest
+/// DMX-512 allows: a full 512-slot frame at 250 kbit/s takes ~22.7 ms.
+const REFRESH: Duration = Duration::from_micros(22_727);
 
 /// Per-transfer timeout for control transfers.
 const USB_TIMEOUT: StdDuration = StdDuration::from_millis(500);
@@ -45,7 +45,9 @@ const _: () = assert!(FIRMWARE.len() > 32, "firmware image is implausibly small"
 static EXECUTOR: StaticCell<Executor> = StaticCell::new();
 
 fn main() {
-    env_logger::init();
+    // Default to info so the lifecycle and sweep-config lines show without the user
+    // having to set RUST_LOG; RUST_LOG still overrides when set.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let executor = EXECUTOR.init(Executor::new());
     executor.run(|spawner| spawner.spawn(run()).unwrap());
 }
@@ -59,6 +61,16 @@ async fn run() {
 }
 
 async fn drive() -> Result<()> {
+    // Bring-up sweep knobs (see the README): which bulk OUT endpoint to stream to,
+    // and whether to prepend a DMX start code. Both are still-unconfirmed details of
+    // the widget's output path, so they are runtime-selectable for hardware testing.
+    let endpoint = env_endpoint().unwrap_or(dmx_piggy::dmx::DEFAULT_OUT_ENDPOINT);
+    let start_code = env_flag("DMX_START_CODE");
+    log::info!(
+        "output config: endpoint {endpoint:#04x}, start code {}",
+        if start_code { "prepended" } else { "off" }
+    );
+
     // Open whichever enumeration stage is currently on the bus.
     let mut host = PiUsbHost::open().context("no widget found on USB")?;
 
@@ -81,12 +93,13 @@ async fn drive() -> Result<()> {
         Err(e) => bail!("probe failed: {e:?}"),
     }
 
-    let mut widget = Widget::new(host);
+    host.start_code = start_code;
+    let mut widget = Widget::with_endpoint(host, endpoint);
 
     let mut universe = Universe::new();
     universe.set(1, 255).expect("channel 1 is in range");
 
-    log::info!("streaming DMX at ~{} Hz", 1000 / REFRESH.as_millis().max(1));
+    log::info!("streaming DMX at ~{} Hz", 1_000_000 / REFRESH.as_micros().max(1));
     let mut ticker = Ticker::every(REFRESH);
     loop {
         widget
@@ -109,6 +122,9 @@ struct PiUsbHost {
     /// so streaming does no per-frame allocation. `None` only while it is in
     /// flight inside a `bulk_out` call.
     frame: Option<Buffer>,
+    /// Bring-up knob: prepend a `0x00` DMX start code to each frame (513 bytes)
+    /// instead of sending the bare 512 channel bytes.
+    start_code: bool,
 }
 
 impl PiUsbHost {
@@ -146,7 +162,38 @@ impl PiUsbHost {
             .claim_interface(0)
             .wait()
             .context("claiming interface 0")?;
-        Ok(Some(Self { interface, dmx_out: None, frame: None }))
+        Ok(Some(Self {
+            interface,
+            dmx_out: None,
+            frame: None,
+            start_code: false,
+        }))
+    }
+}
+
+/// Parse `DMX_ENDPOINT` (e.g. `0x04` or `4`) into a bulk OUT endpoint address.
+/// Returns `None` when unset or unparseable, so the caller can fall back.
+fn env_endpoint() -> Option<u8> {
+    let raw = std::env::var("DMX_ENDPOINT").ok()?;
+    let raw = raw.trim();
+    let parsed = match raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
+        Some(hex) => u8::from_str_radix(hex, 16),
+        None => raw.parse::<u8>(),
+    };
+    match parsed {
+        Ok(ep) => Some(ep),
+        Err(_) => {
+            log::warn!("ignoring unparseable DMX_ENDPOINT={raw:?}");
+            None
+        }
+    }
+}
+
+/// A truthy env flag: set to anything other than empty / `0` / `false` / `no`.
+fn env_flag(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(v) => !matches!(v.trim(), "" | "0" | "false" | "no"),
+        Err(_) => false,
     }
 }
 
@@ -230,11 +277,15 @@ impl Transport for PiUsbHost {
         // crate's no_alloc spirit even on a hosted target.
         if self.dmx_out.is_none() {
             self.dmx_out = Some(self.interface.endpoint::<Bulk, Out>(endpoint)?);
-            self.frame = Some(Buffer::new(CHANNELS));
+            // +1 leaves room for an optionally prepended start code.
+            self.frame = Some(Buffer::new(CHANNELS + 1));
         }
         let ep = self.dmx_out.as_mut().expect("just populated");
         let mut buf = self.frame.take().expect("frame buffer is reclaimed after each send");
         buf.clear();
+        if self.start_code {
+            buf.extend_from_slice(&[0x00]);
+        }
         buf.extend_from_slice(data);
         // Blocking transfer: no async reactor is involved, so this works under the
         // Embassy executor. Reclaim the buffer from the completion before surfacing

@@ -226,6 +226,28 @@ rule covers both product IDs, because the device re-enumerates from `0x0CB0:0x00
 needs access to both. `MODE="0666"` lets any local user open it; edit the rule to
 `MODE="0660", GROUP="plugdev"` if you would rather restrict access to that group.
 
+## Bringing up the DMX output
+
+Two details of the output path are not yet confirmed on hardware (see
+[Status](#status)): which of the three bulk OUT endpoints (`0x02` / `0x04` /
+`0x05`) feeds the transmit engine, and whether the firmware wants a DMX start code
+prepended. The example exposes both as environment variables, so you can sweep the
+combinations while watching the widget's `tx mode` / `dmx ok` LEDs — patch a fixture
+to channel 1, which the example drives to full:
+
+```console
+$ DMX_ENDPOINT=0x04 DMX_START_CODE=1 ./target/debug/piggy-embassy-dmx
+```
+
+- `DMX_ENDPOINT` — bulk OUT endpoint, hex (`0x04`) or decimal (`4`); default `0x02`.
+- `DMX_START_CODE` — set truthy to prepend a `0x00` start code, sending 513 bytes
+  rather than 512. (512 is an exact multiple of the widget's 64-byte packet size, so
+  the bare frame ends on a full packet with no terminating short packet; the start
+  code both supplies the DMX framing and terminates the transfer.)
+
+Each run logs its active `output config` at startup. Once a combination lights
+`tx mode`, that pins down both TODOs.
+
 ## Receiving DMX
 
 This firmware cannot receive DMX. The rear panel has a receive indicator and the
