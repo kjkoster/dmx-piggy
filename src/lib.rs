@@ -27,10 +27,12 @@ pub mod dmx;
 pub mod error;
 pub mod firmware;
 pub mod identity;
+pub mod query;
 pub mod transport;
 
 pub use anchor::upload;
-pub use device::Widget;
+pub use device::{Mode, Widget};
 pub use dmx::Universe;
 pub use error::Error;
+pub use query::{read_id, read_serial};
 pub use transport::Transport;

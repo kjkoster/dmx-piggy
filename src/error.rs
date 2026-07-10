@@ -16,4 +16,6 @@ pub enum Error<E> {
     ShortDescriptor,
     /// The device did not identify as this vendor's widget.
     NotAWidget,
+    /// A vendor query's reply was absent or did not echo the opcode it answers.
+    UnexpectedReply,
 }

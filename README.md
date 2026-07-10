@@ -71,6 +71,7 @@ match probe(&mut transport).await? {
 }
 
 let mut widget = Widget::new(transport);
+widget.start().await?;          // enter transmit mode (required before sending)
 let mut universe = Universe::new();
 universe.set(1, 255)?;          // channel 1 to full
 widget.send(&universe).await?;  // repeat at ~40 Hz
@@ -105,21 +106,24 @@ property of your host stack, not of the widget.
 
 ## Use case 2 — Send DMX
 
-**In plain terms.** Once firmware is running, you send it a full frame of 512
-channel values, over and over, a few dozen times a second. The box does the
-fiddly electrical timing of DMX itself.
+**In plain terms.** Once firmware is running, you first tell the box to start
+transmitting (it boots idle and drives nothing until told), then send it a full
+frame of 512 channel values, over and over, a few dozen times a second. The box
+does the fiddly electrical timing of DMX itself.
 
-**Technically.** The loaded device exposes a vendor interface with bulk
-endpoints. A universe is one bulk OUT transfer of 512 bytes, with no header on
-the wire; the firmware generates the DMX break, mark-after-break and byte framing
-on its own timing. You need only keep sending frames at your chosen refresh rate.
-[`Universe`](src/dmx.rs) is a fixed 512-byte buffer with 1-based channel
-addressing.
-
-> **Not yet pinned:** the device advertises three bulk OUT endpoints
-> (`0x02`, `0x04`, `0x05`) and it is not yet proven from the firmware alone which
-> one carries the universe. The default is `0x02`; [`Widget::with_endpoint`]
-> lets you try the others. See [Status](#status).
+**Technically.** The loaded device boots idle — the RS-485 driver is disabled and
+the frame engine is off — so [`Widget::start`](src/device.rs) must first send the
+mode command (`01 01`) to enter transmit mode; without it the driver-enable never
+goes high and no DMX reaches the wire. Then a universe is delivered to endpoint
+`0x02` as a sequence of tagged **chunks**: each packet is a 3-byte header (a tag, then a 16-bit little-endian
+offset into the channel buffer) followed by up to 61 channel bytes. Fill chunks
+(`0x30`) load the buffer; the final chunk (`0x31`) commits the frame, swapping the
+firmware's double buffer and triggering transmission. Send channel data only — the
+firmware inserts the DMX start code and does the electrical timing (break,
+mark-after-break, byte framing). A full 512-channel universe is ~9 chunk writes,
+repeated at your chosen refresh rate. [`Universe`](src/dmx.rs) is a fixed 512-byte
+buffer with 1-based channel addressing; [`dmx::send`](src/dmx.rs) does the
+chunking.
 
 ## Use case 3 — Status LEDs
 
@@ -146,14 +150,15 @@ useful bring-up feedback: if your framing and cadence are right, they show it.
    dmx-piggy = "0.1"
    ```
 
-3. **Implement [`Transport`](src/transport.rs)** for your USB host — three
-   `async` methods: `control_out`, `control_in`, `bulk_out`.
+3. **Implement [`Transport`](src/transport.rs)** for your USB host — four
+   `async` methods: `control_out`, `control_in`, `bulk_out`, `bulk_in`.
 
 4. **Embed the firmware** in your binary and validate it at build time (see
    [Embedding the firmware](#embedding-the-firmware)).
 
 5. **Drive the lifecycle:** [`probe`] → [`upload`] if unloaded → wait for
-   re-enumeration → [`Widget::send`] in a loop.
+   re-enumeration → [`Widget::start`] (enter transmit mode) → [`Widget::send`] in
+   a loop.
 
 ### Embedding the firmware
 
@@ -228,34 +233,35 @@ needs access to both. `MODE="0666"` lets any local user open it; edit the rule t
 
 ## Bringing up the DMX output
 
-Two details of the output path are not yet confirmed on hardware (see
+One detail of the output path is not yet confirmed on hardware (see
 [Status](#status)): which of the three bulk OUT endpoints (`0x02` / `0x04` /
-`0x05`) feeds the transmit engine, and whether the firmware wants a DMX start code
-prepended. The example exposes both as environment variables, so you can sweep the
-combinations while watching the widget's `tx mode` / `dmx ok` LEDs — patch a fixture
-to channel 1, which the example drives to full:
+`0x05`) feeds the transmit engine. The example exposes it as an environment
+variable, so you can sweep the endpoints while watching the widget's `tx mode` /
+`dmx ok` LEDs — patch a fixture to channel 1, which the example drives to full:
 
 ```console
-$ DMX_ENDPOINT=0x04 DMX_START_CODE=1 ./target/debug/piggy-embassy-dmx
+$ DMX_ENDPOINT=0x04 ./target/debug/piggy-embassy-dmx
 ```
 
 - `DMX_ENDPOINT` — bulk OUT endpoint, hex (`0x04`) or decimal (`4`); default `0x02`.
-- `DMX_START_CODE` — set truthy to prepend a `0x00` start code, sending 513 bytes
-  rather than 512. (512 is an exact multiple of the widget's 64-byte packet size, so
-  the bare frame ends on a full packet with no terminating short packet; the start
-  code both supplies the DMX framing and terminates the transfer.)
 
-Each run logs its active `output config` at startup. Once a combination lights
-`tx mode`, that pins down both TODOs.
+Each run logs its active `output config` at startup. Once an endpoint lights
+`tx mode`, that pins down the last output TODO.
+
+The frame is a bare 512-byte universe with **no** start code: the firmware
+prepends the DMX start code itself (confirmed from the firmware disassembly).
 
 ## Receiving DMX
 
-This firmware cannot receive DMX. The rear panel has a receive indicator and the
-hardware is capable (the MAX483 is a transceiver, and the loaded device even
-advertises bulk IN endpoints), but the shipped image configures the UART
-transmit-only. The receiver is never enabled and received bytes are never read.
-Receiving, for troubleshooting or otherwise, would need a different firmware
-variant or your own. In fact, we are not even sure that the MAX483 is wired to the main MCU to receive data. This is out of scope for the crate.
+The firmware *does* support receiving: the mode command's `Mode::Receive` (`01 02`)
+enables the UART receiver and arms the RX buffers, the symmetric partner of the
+transmit mode this crate drives. The hardware backs it up — the MAX483 is a
+transceiver and the loaded device advertises bulk IN endpoints.
+
+What this crate does **not** yet implement is reading received frames back from the
+device — entering the mode is supported, but the command(s) that hand received DMX
+to the host have not been mapped. That is out of scope for now (tracked under
+[Status](#status)).
 
 ## Bring your own firmware
 
@@ -283,17 +289,26 @@ Confirmed and implemented:
 
 - Two-stage identity and detection (`0x0CB0:0x0001` → `0x0002`).
 - Anchor firmware upload, with per-record Intel HEX validation.
-- 512-byte, header-less universe framing.
+- Chunked universe framing on endpoint `0x02`: tagged 3-byte-header chunks
+  (`0x30` fill, `0x31` commit), decoded from the firmware reassembler.
+- Vendor identity queries: serial (`0x09`) and unique ID (`0x23`), cross-checked
+  against the USB descriptors.
+- Start code is prepended by the firmware; the host sends 512 bare channel bytes,
+  so channel _n_ is slot _n_ (confirmed from the firmware disassembly).
+- Mode command (`0x01`): the device boots idle and drives nothing until told;
+  `Widget::start` enters transmit mode (`Mode::Transmit`), the symmetric partner
+  of receive (`Mode::Receive`). Traced from the firmware.
 - LEDs are firmware-driven and autonomous (nothing for the crate to do).
-- No authentication anywhere; firmware is transmit-only (no DMX receive).
+- No authentication anywhere in the protocol.
 
 Open items (tracked as `TODO` in the source):
 
-- **DMX OUT endpoint** — one of `0x02` / `0x04` / `0x05`; confirm on hardware or
-  by tracing the transmit engine, then reduce to a single constant.
-- **Start-code placement** — whether the firmware prepends the DMX start code or
-  expects it in the first slot; this fixes channel-to-index mapping.
+- **Commit tag `0x32`** — shares the `0x31` commit path; its distinction (likely
+  one-shot vs continuous retransmit) is unconfirmed, so the send path uses `0x31`.
 - **Example transport** — the RP2040 USB host wiring, and the Embassy version
   pins.
-- **DMX Receive Mode** - Need to check that the wiring allows for that.
+- **DMX receive** — `Mode::Receive` enters the firmware's receive mode, but
+  reading received frames back from the device is not yet implemented.
+- **Other modes** — stop / transmit / receive are traced; any further modes
+  (e.g. RDM) are not yet explored.
 
