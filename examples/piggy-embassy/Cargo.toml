@@ -25,6 +25,9 @@ static_cell = "2"
 log = "0.4"
 env_logger = "0.11"
 anyhow = "1"
+# Traps Ctrl-C / SIGTERM so the app can stop the widget cleanly instead of
+# leaving it stuck in transmit mode. "termination" adds SIGTERM/SIGHUP handling.
+ctrlc = { version = "3", features = ["termination"] }
 
 [profile.release]
 lto = true

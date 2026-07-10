@@ -6,6 +6,7 @@
 //! tokio/smol reactor that Embassy does not provide. Each USB transfer briefly
 //! blocks the (single-threaded) executor, which is fine for a one-widget streamer.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration as StdDuration;
 
 use anyhow::{bail, Context, Result};
@@ -48,6 +49,11 @@ const _: () = assert!(FIRMWARE.len() > 32, "firmware image is implausibly small"
 
 static EXECUTOR: StaticCell<Executor> = StaticCell::new();
 
+/// Set by the Ctrl-C / SIGTERM handler so the stream loop can break out and put
+/// the widget back to idle, instead of leaving it stuck in transmit mode with the
+/// LEDs blinking in panic.
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
 fn main() {
     // Default to info so the lifecycle and sweep-config lines show without the user
     // having to set RUST_LOG; RUST_LOG still overrides when set.
@@ -58,13 +64,23 @@ fn main() {
 
 #[embassy_executor::task]
 async fn run() {
-    if let Err(e) = drive().await {
-        log::error!("{e:#}");
-        std::process::exit(1);
+    // The Embassy executor never returns, so exit the process explicitly once the
+    // driver is done — cleanly on Ok (after the widget was stopped), non-zero on error.
+    match drive().await {
+        Ok(()) => std::process::exit(0),
+        Err(e) => {
+            log::error!("{e:#}");
+            std::process::exit(1);
+        }
     }
 }
 
 async fn drive() -> Result<()> {
+    // Trap Ctrl-C / SIGTERM. The handler only flips a flag; the stream loop sees it
+    // and calls widget.stop() so the device is never left transmitting.
+    ctrlc::set_handler(|| SHUTDOWN.store(true, Ordering::SeqCst))
+        .context("installing shutdown handler")?;
+
     // The firmware services exactly one bulk OUT endpoint (0x02); 0x04 stalls and
     // 0x05 is silently dropped. Settled from the decompilation — see USB-PATHS.md.
     let endpoint = dmx_piggy::dmx::DEFAULT_OUT_ENDPOINT;
@@ -122,6 +138,9 @@ async fn drive() -> Result<()> {
     let mut window: u32 = 0;
     let mut last_report = Instant::now();
     loop {
+        if SHUTDOWN.load(Ordering::Relaxed) {
+            break;
+        }
         widget
             .send(&universe)
             .await
@@ -139,6 +158,16 @@ async fn drive() -> Result<()> {
         }
         ticker.next().await;
     }
+
+    // Left the loop on a shutdown signal: return the widget to idle so it stops
+    // driving the DMX line and does not sit blinking in panic.
+    log::info!("shutdown requested; stopping DMX and releasing the bus");
+    widget
+        .stop()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to stop the widget: {e:?}"))?;
+    log::info!("widget stopped cleanly");
+    Ok(())
 }
 
 /// USB host transport for the widget, backed by `nusb`.
