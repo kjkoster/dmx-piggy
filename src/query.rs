@@ -12,11 +12,13 @@
 //! cheap, safe connectivity/identity check to run once at bring-up — proving the
 //! command/response transport before any DMX is streamed.
 
+use crate::dmx::DEFAULT_OUT_ENDPOINT;
 use crate::error::Error;
 use crate::transport::Transport;
 
-/// Command (bulk OUT) endpoint that carries vendor queries.
-const CMD_ENDPOINT: u8 = 0x02;
+/// Command (bulk OUT) endpoint that carries vendor queries — the single live OUT
+/// endpoint, shared with the DMX chunk stream (see [`DEFAULT_OUT_ENDPOINT`]).
+const CMD_ENDPOINT: u8 = DEFAULT_OUT_ENDPOINT;
 /// Status (bulk IN) endpoint that carries the replies.
 const STATUS_ENDPOINT: u8 = 0x82;
 
@@ -28,16 +30,26 @@ const OP_ID: u8 = 0x23;
 /// Length of the unique-ID value, in bytes (a 48-bit identifier).
 pub const ID_LEN: usize = 6;
 
-/// Opcode `0x0B` is a *reserved, unsafe* command: it is a parameterised memory
-/// read (firmware routine `0x14A7`) that stalls under most inputs and hangs the
-/// device outright on a bad address, requiring a power-cycle to recover. This
-/// crate must never send it; the value is named here so it is documented rather
-/// than silently avoided.
+/// Opcode `0x0B` is a *reserved, destructive* command: it runs a RAM self-test
+/// (firmware routine `0x14A7`, dispatched at `0x0634`) that fills, verifies, and
+/// zeros XDATA `0x2000..0x7B00` — a range that **contains the DMX frame buffers**
+/// (`0x6000`/`0x6500`/`0x6A00`) — then replies with a pass/fail byte. It takes no
+/// argument, but it wipes the outgoing universe and stalls the device while it
+/// runs. This crate must never send it; the value is named here so it is
+/// documented rather than silently avoided.
+///
+/// Note also that its reply puts the pass/fail result in byte 0, *not* an opcode
+/// echo, so it would fail [`query`]'s echo check even if it were sent.
 pub const RESERVED_UNSAFE_OP: u8 = 0x0B;
 
-/// Headroom for a reply buffer. Replies observed so far are at most 7 bytes
-/// (opcode + 6), well within this.
-const REPLY_MAX: usize = 16;
+/// Size of a reply buffer. Replies observed so far are at most 7 bytes
+/// (opcode + 6), but the status endpoint ([`STATUS_ENDPOINT`]) is a bulk IN
+/// endpoint with a 64-byte max packet size, and Linux `usbdevfs` on the Pi
+/// rejects any bulk-IN submission whose length is not a whole multiple of that
+/// (`EINVAL`). So the buffer must be a multiple of 64, not merely "big enough":
+/// the device short-replies with a partial packet, which terminates the
+/// transfer, and [`query`] returns the real byte count.
+const REPLY_MAX: usize = 64;
 
 /// Read the device serial number.
 ///

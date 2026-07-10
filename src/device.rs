@@ -35,8 +35,8 @@ pub async fn probe<T: Transport>(transport: &mut T) -> Result<State, Error<T::Er
 /// Vendor mode-command opcode (byte 0 of the command; byte 1 is the mode).
 const MODE_COMMAND: u8 = 0x01;
 
-/// Bulk OUT endpoint that carries vendor commands. The mode command always goes
-/// here, independent of any [`Widget::with_endpoint`] override for DMX data.
+/// Bulk OUT endpoint that carries vendor commands — the same single live OUT
+/// endpoint the DMX chunks use (see [`crate::dmx::DEFAULT_OUT_ENDPOINT`]).
 const COMMAND_ENDPOINT: u8 = 0x02;
 
 /// The widget's operating mode, selected with the mode command.
@@ -62,24 +62,12 @@ pub enum Mode {
 /// (see [`probe`]); it does not itself upload firmware.
 pub struct Widget<T> {
     transport: T,
-    endpoint: u8,
 }
 
 impl<T: Transport> Widget<T> {
-    /// Wrap a transport, assuming the default output endpoint.
+    /// Wrap a loaded widget's transport.
     pub fn new(transport: T) -> Self {
-        Self {
-            transport,
-            endpoint: DEFAULT_OUT_ENDPOINT,
-        }
-    }
-
-    /// Wrap a transport with an explicit output endpoint.
-    ///
-    /// Useful while the correct endpoint is still being confirmed against
-    /// [`crate::dmx::OUT_ENDPOINT_CANDIDATES`].
-    pub fn with_endpoint(transport: T, endpoint: u8) -> Self {
-        Self { transport, endpoint }
+        Self { transport }
     }
 
     /// Enter an operating [`Mode`].
@@ -110,7 +98,7 @@ impl<T: Transport> Widget<T> {
 
     /// Send one universe frame. Call at the desired refresh rate, after [`start`](Self::start).
     pub async fn send(&mut self, universe: &Universe) -> Result<(), Error<T::Error>> {
-        send(&mut self.transport, self.endpoint, universe).await
+        send(&mut self.transport, DEFAULT_OUT_ENDPOINT, universe).await
     }
 
     /// Recover the wrapped transport.

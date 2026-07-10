@@ -11,8 +11,9 @@ handful of `async` transfers. Due to license restrictions, Firmware is **not**
 included in this repository. See [Bring your own
 firmware](#bring-your-own-firmware).
 
-Status: _early_. The firmware upload and DMX framing are implemented; one detail
-of the output path is still to be confirmed on hardware (see [Status](#status)).
+Status: _early_. The firmware upload and DMX framing are implemented and the
+output path (endpoint `0x02`) is settled from the decompilation (see
+[Status](#status)).
 
 ---
 
@@ -233,20 +234,20 @@ needs access to both. `MODE="0666"` lets any local user open it; edit the rule t
 
 ## Bringing up the DMX output
 
-One detail of the output path is not yet confirmed on hardware (see
-[Status](#status)): which of the three bulk OUT endpoints (`0x02` / `0x04` /
-`0x05`) feeds the transmit engine. The example exposes it as an environment
-variable, so you can sweep the endpoints while watching the widget's `tx mode` /
-`dmx ok` LEDs — patch a fixture to channel 1, which the example drives to full:
+The interface advertises three bulk OUT endpoints (`0x02` / `0x04` / `0x05`), but
+the firmware services exactly one: `0x02`. The decompilation settles this — its
+`cmd_dispatch` and `dmx_chunk_write` read only the `0x02` buffer/byte-count
+registers, `0x04` stalls (its byte count is never armed), and `0x05` is accepted
+by the SIE but silently dropped (a shared-descriptor artifact). See
+`bore-hog/USB-PATHS.md`. The example streams to `0x02` unconditionally; patch a
+fixture to channel 1, which it drives to full, and watch the widget's `tx mode` /
+`dmx ok` LEDs:
 
 ```console
-$ DMX_ENDPOINT=0x04 ./target/debug/piggy-embassy-dmx
+$ ./target/debug/piggy-embassy-dmx
 ```
 
-- `DMX_ENDPOINT` — bulk OUT endpoint, hex (`0x04`) or decimal (`4`); default `0x02`.
-
-Each run logs its active `output config` at startup. Once an endpoint lights
-`tx mode`, that pins down the last output TODO.
+Each run logs its `output config` at startup.
 
 The frame is a bare 512-byte universe with **no** start code: the firmware
 prepends the DMX start code itself (confirmed from the firmware disassembly).

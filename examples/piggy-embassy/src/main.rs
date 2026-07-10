@@ -6,8 +6,6 @@
 //! tokio/smol reactor that Embassy does not provide. Each USB transfer briefly
 //! blocks the (single-threaded) executor, which is fine for a one-widget streamer.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
 use std::time::Duration as StdDuration;
 
 use anyhow::{bail, Context, Result};
@@ -18,7 +16,7 @@ use dmx_piggy::{
     identity::State,
     Transport, Widget,
 };
-use embassy_executor::{Executor, Spawner};
+use embassy_executor::Executor;
 use embassy_time::{Duration, Instant, Ticker, Timer};
 use nusb::transfer::{Buffer, Bulk, ControlIn, ControlOut, ControlType, In, Out, Recipient, TransferError};
 use nusb::MaybeFuture;
@@ -50,35 +48,26 @@ const _: () = assert!(FIRMWARE.len() > 32, "firmware image is implausibly small"
 
 static EXECUTOR: StaticCell<Executor> = StaticCell::new();
 
-/// Frames sent on the OUT endpoint so far. The out-of-band status reader watches
-/// this to fire its reads only after substantial traffic, without touching the
-/// refresh loop's own state.
-static FRAMES: AtomicU64 = AtomicU64::new(0);
-
-/// A snapshot of the frame being streamed, published once so the status reader
-/// can log the read alongside the real OUT that precedes it.
-static LAST_OUT: Mutex<Option<LastOut>> = Mutex::new(None);
-
 fn main() {
     // Default to info so the lifecycle and sweep-config lines show without the user
     // having to set RUST_LOG; RUST_LOG still overrides when set.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let executor = EXECUTOR.init(Executor::new());
-    executor.run(|spawner| spawner.spawn(run(spawner)).unwrap());
+    executor.run(|spawner| spawner.spawn(run()).unwrap());
 }
 
 #[embassy_executor::task]
-async fn run(spawner: Spawner) {
-    if let Err(e) = drive(spawner).await {
+async fn run() {
+    if let Err(e) = drive().await {
         log::error!("{e:#}");
         std::process::exit(1);
     }
 }
 
-async fn drive(spawner: Spawner) -> Result<()> {
-    // Bring-up sweep knob (see the README): which bulk OUT endpoint to stream to.
-    // Still unconfirmed, so it stays runtime-selectable for hardware testing.
-    let endpoint = env_endpoint().unwrap_or(dmx_piggy::dmx::DEFAULT_OUT_ENDPOINT);
+async fn drive() -> Result<()> {
+    // The firmware services exactly one bulk OUT endpoint (0x02); 0x04 stalls and
+    // 0x05 is silently dropped. Settled from the decompilation — see USB-PATHS.md.
+    let endpoint = dmx_piggy::dmx::DEFAULT_OUT_ENDPOINT;
     log::info!("output config: endpoint {endpoint:#04x}");
 
     // Open whichever enumeration stage is currently on the bus.
@@ -110,15 +99,11 @@ async fn drive(spawner: Spawner) -> Result<()> {
         Err(e) => log::warn!("serial query failed: {e:?}"),
     }
     match dmx_piggy::read_id(&mut host).await {
-        Ok(id) => log::info!("widget id: {}", id.iter().map(|b| format!("{b:02x}")).collect::<String>()),
+        Ok(id) => log::info!("widget id: 0x{}", id.iter().map(|b| format!("{b:02x}")).collect::<String>()),
         Err(e) => log::warn!("id query failed: {e:?}"),
     }
 
-    // A second handle to the same claimed interface, for the out-of-band status
-    // reader. Cloned before `host` is moved into the widget below.
-    let reader = host.clone_for_reading();
-
-    let mut widget = Widget::with_endpoint(host, endpoint);
+    let mut widget = Widget::new(host);
 
     // The widget boots idle (driver disabled, frame engine off). Enter transmit
     // mode before streaming, or nothing reaches the XLR however correct the frames.
@@ -131,15 +116,9 @@ async fn drive(spawner: Spawner) -> Result<()> {
     let mut universe = Universe::new();
     universe.set(1, 255).expect("channel 1 is in range");
 
-    // Publish the (constant) streamed frame, then start the status reader on its
-    // own task. It reads 0x82 twice — after 100 and 200 frames — never from inside
-    // the refresh loop. The blocking read briefly freezes the executor, which is
-    // fine for this diagnostic.
-    publish_streamed_frame(endpoint, universe.frame());
-    spawner.spawn(status_reader(reader)).expect("spawn status reader");
-
     log::info!("streaming DMX at ~{} Hz", 1_000_000 / REFRESH.as_micros().max(1));
     let mut ticker = Ticker::every(REFRESH);
+    let mut frames: u64 = 0;
     let mut window: u32 = 0;
     let mut last_report = Instant::now();
     loop {
@@ -147,7 +126,7 @@ async fn drive(spawner: Spawner) -> Result<()> {
             .send(&universe)
             .await
             .map_err(|e| anyhow::anyhow!("DMX send failed: {e:?}"))?;
-        let frames = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+        frames += 1;
         window += 1;
         // A steadily climbing counter is a live stream; a frozen one (with the
         // error above) is a stall. Report roughly every two seconds.
@@ -162,35 +141,6 @@ async fn drive(spawner: Spawner) -> Result<()> {
     }
 }
 
-/// Out-of-band status reader: after the stream has warmed up, read `0x82` twice
-/// — once after ~100 frames on the OUT endpoint, once after ~200 — logging each
-/// alongside the frame that precedes it. Runs on its own task; never inside the
-/// refresh loop. `0x84`/`0x85` are settled (always silent) and left alone.
-#[embassy_executor::task]
-async fn status_reader(mut host: PiUsbHost) {
-    for target in [100_u64, 200] {
-        while FRAMES.load(Ordering::Relaxed) < target {
-            Timer::after(Duration::from_millis(10)).await;
-        }
-        let frames = FRAMES.load(Ordering::Relaxed);
-        let last_out = last_out_summary();
-        let mut buf = [0u8; 64];
-        match host.bulk_in(0x82, &mut buf).await {
-            Ok(0) => log::info!(
-                "IN 0x82 after {frames} frames: silent (no data in timeout); last OUT: {last_out}"
-            ),
-            Ok(n) => log::info!(
-                "IN 0x82 after {frames} frames: {n} bytes [{}]; last OUT: {last_out}",
-                hex(&buf[..n])
-            ),
-            Err(e) => log::warn!(
-                "IN 0x82 after {frames} frames: read error: {e:#}; last OUT: {last_out}"
-            ),
-        }
-    }
-    log::info!("status reader done");
-}
-
 /// USB host transport for the widget, backed by `nusb`.
 ///
 /// This is the single per-platform integration point, and on Linux it is fully
@@ -203,16 +153,6 @@ struct PiUsbHost {
     /// so streaming does no per-frame allocation. `None` only while it is in
     /// flight inside a `bulk_out` call.
     frame: Option<Buffer>,
-}
-
-/// A bounded snapshot of an OUT frame, for pairing a status read with the traffic
-/// that precedes it in the diagnostic log.
-#[derive(Clone, Copy)]
-struct LastOut {
-    endpoint: u8,
-    len: usize,
-    head: [u8; 16],
-    head_len: usize,
 }
 
 impl PiUsbHost {
@@ -255,72 +195,6 @@ impl PiUsbHost {
             dmx_out: None,
             frame: None,
         }))
-    }
-
-    /// A second host sharing the same claimed interface, for the out-of-band
-    /// status reader. `nusb::Interface` is a cheap, shareable handle; the clone
-    /// reads `0x82` while the original streams on the OUT endpoint.
-    fn clone_for_reading(&self) -> Self {
-        Self {
-            interface: self.interface.clone(),
-            dmx_out: None,
-            frame: None,
-        }
-    }
-}
-
-/// Format bytes as space-separated lowercase hex.
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ")
-}
-
-/// Publish a bounded snapshot of the frame being streamed, so the status reader
-/// can log its read alongside the real OUT traffic. The streamed frame is
-/// constant, so this is set once.
-fn publish_streamed_frame(endpoint: u8, frame: &[u8]) {
-    let mut head = [0u8; 16];
-    let head_len = frame.len().min(head.len());
-    head[..head_len].copy_from_slice(&frame[..head_len]);
-    *LAST_OUT.lock().unwrap() = Some(LastOut {
-        endpoint,
-        len: frame.len(),
-        head,
-        head_len,
-    });
-}
-
-/// Human-readable summary of the last published OUT frame, for the status log.
-fn last_out_summary() -> String {
-    match *LAST_OUT.lock().unwrap() {
-        None => "none".to_string(),
-        Some(o) => {
-            let ellipsis = if o.len > o.head_len { " …" } else { "" };
-            format!(
-                "ep {:#04x}, {} bytes [{}{}]",
-                o.endpoint,
-                o.len,
-                hex(&o.head[..o.head_len]),
-                ellipsis
-            )
-        }
-    }
-}
-
-/// Parse `DMX_ENDPOINT` (e.g. `0x04` or `4`) into a bulk OUT endpoint address.
-/// Returns `None` when unset or unparseable, so the caller can fall back.
-fn env_endpoint() -> Option<u8> {
-    let raw = std::env::var("DMX_ENDPOINT").ok()?;
-    let raw = raw.trim();
-    let parsed = match raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
-        Some(hex) => u8::from_str_radix(hex, 16),
-        None => raw.parse::<u8>(),
-    };
-    match parsed {
-        Ok(ep) => Some(ep),
-        Err(_) => {
-            log::warn!("ignoring unparseable DMX_ENDPOINT={raw:?}");
-            None
-        }
     }
 }
 

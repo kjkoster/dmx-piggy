@@ -6,15 +6,15 @@ use crate::transport::Transport;
 /// Channels in one DMX-512 universe.
 pub const CHANNELS: usize = 512;
 
-/// The bulk OUT endpoints the loaded device advertises.
+/// The bulk OUT endpoint that carries DMX chunks (and every vendor command).
 ///
-/// The DMX data channel is `0x02` (confirmed from the firmware: it is where the
-/// chunk reassembler reads commands). `0x04` stalls, `0x05` is not used for data.
-/// Kept as a list only for [`crate::device::Widget::with_endpoint`] experiments.
-pub const OUT_ENDPOINT_CANDIDATES: [u8; 3] = [0x02, 0x04, 0x05];
-
-/// The DMX data endpoint that the chunked frame is delivered to.
-pub const DEFAULT_OUT_ENDPOINT: u8 = OUT_ENDPOINT_CANDIDATES[0];
+/// The interface advertises three bulk OUT endpoints (`0x02` / `0x04` / `0x05`),
+/// but the firmware services exactly one. `cmd_dispatch` and `dmx_chunk_write`
+/// read only `OUT2BUF`/`OUT2BC` — endpoint `0x02`. `0x04` stalls (its byte count
+/// is never armed) and `0x05` is accepted by the SIE but silently dropped, a
+/// shared-descriptor artifact rather than a second data path. This is settled
+/// from the decompilation; see `bore-hog/USB-PATHS.md`.
+pub const DEFAULT_OUT_ENDPOINT: u8 = 0x02;
 
 /// Channel address outside the DMX range `1..=512`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
