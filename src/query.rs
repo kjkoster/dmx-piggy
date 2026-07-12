@@ -26,6 +26,8 @@ const STATUS_ENDPOINT: u8 = 0x82;
 const OP_SERIAL: u8 = 0x09;
 /// Query opcode: read the 48-bit unique ID.
 const OP_ID: u8 = 0x23;
+/// Query opcode: read the current operating mode. Replies `[0x02, 0x00, mode]`.
+const OP_MODE: u8 = 0x02;
 
 /// Length of the unique-ID value, in bytes (a 48-bit identifier).
 pub const ID_LEN: usize = 6;
@@ -71,6 +73,21 @@ pub async fn read_id<T: Transport>(transport: &mut T) -> Result<[u8; ID_LEN], Er
     let mut id = [0u8; ID_LEN];
     id.copy_from_slice(&reply[1..1 + ID_LEN]);
     Ok(id)
+}
+
+/// Read the device's current operating mode: `0` stop, `1` transmit, `2`
+/// receive (see [`crate::Mode`]).
+///
+/// The reply is `[0x02, 0x00, mode]`. Useful as a bring-up sanity check that a
+/// mode command actually took effect — it exercises the same command/response
+/// path the mode writes use.
+pub async fn read_mode<T: Transport>(transport: &mut T) -> Result<u8, Error<T::Error>> {
+    let mut reply = [0u8; REPLY_MAX];
+    let n = query(transport, OP_MODE, &mut reply).await?;
+    if n < 3 {
+        return Err(Error::UnexpectedReply);
+    }
+    Ok(reply[2])
 }
 
 /// Send a single-byte query and capture its reply, validating that the device
@@ -152,6 +169,7 @@ mod tests {
             let reply: &[u8] = match self.last {
                 0x09 => &[0x09, 0xff, 0x0f, 0x00],
                 0x23 => &[0x23, 0xa9, 0x3e, 0x56, 0x01, 0xed, 0x8d],
+                0x02 => &[0x02, 0x00, 0x02], // mode query: mode 2 (receive)
                 _ => &[],
             };
             let n = reply.len().min(buf.len());
@@ -173,6 +191,12 @@ mod tests {
             block_on(read_id(&mut t)).unwrap(),
             [0xa9, 0x3e, 0x56, 0x01, 0xed, 0x8d],
         );
+    }
+
+    #[test]
+    fn reads_the_operating_mode() {
+        let mut t = Fake { last: 0 };
+        assert_eq!(block_on(read_mode(&mut t)).unwrap(), 2);
     }
 
     #[test]

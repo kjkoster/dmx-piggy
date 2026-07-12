@@ -59,7 +59,10 @@ fn main() {
     // having to set RUST_LOG; RUST_LOG still overrides when set.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let executor = EXECUTOR.init(Executor::new());
-    executor.run(|spawner| spawner.spawn(run()).unwrap());
+    // embassy-executor 0.10: the `#[task]` fn returns `Result<SpawnToken, _>`
+    // (pool allocation happens here) and `spawn` consumes the token infallibly, so
+    // the `.unwrap()` sits on `run()`, not on `spawn(..)`.
+    executor.run(|spawner| spawner.spawn(run().unwrap()));
 }
 
 #[embassy_executor::task]

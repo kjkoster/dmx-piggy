@@ -254,15 +254,120 @@ prepends the DMX start code itself (confirmed from the firmware disassembly).
 
 ## Receiving DMX
 
-The firmware *does* support receiving: the mode command's `Mode::Receive` (`01 02`)
-enables the UART receiver and arms the RX buffers, the symmetric partner of the
-transmit mode this crate drives. The hardware backs it up — the MAX483 is a
-transceiver and the loaded device advertises bulk IN endpoints.
+The widget is a full transceiver, and the crate now drives both directions: the
+mode command's `Mode::Receive` (`01 02`) enables the UART receiver, and
+[`Receiver`](src/receive.rs) reassembles the frames the firmware streams back on
+bulk IN endpoint `0x84` (a `0x40`/`0x41`/`0x42` chunk run per frame, with an
+optional start-code filter). Transmit and receive are mutually exclusive — one
+mode register drives the RS-485 direction — which is why they are two types
+(`Widget` / `Receiver`) rather than two methods. See `RECEIVE.md` for the wire
+format and firmware provenance.
 
-What this crate does **not** yet implement is reading received frames back from the
-device — entering the mode is supported, but the command(s) that hand received DMX
-to the host have not been mapped. That is out of scope for now (tracked under
-[Status](#status)).
+## The validation rig
+
+[`examples/dmx-validator`](examples/dmx-validator) proves the driver against an
+independent reference transceiver — the
+[`zihatec-rs-485-dmx`](https://crates.io/crates/zihatec-rs-485-dmx) crate
+driving a serial DMX interface on a Raspberry Pi — over a physical XLR loop:
+serial → widget (forward), then widget → serial (reverse). The Pi and
+interface setup the rig assumes (UART overlay, transceiver direction control)
+is documented with that crate. USB access for the widget itself is covered in
+[USB permissions on Linux](#usb-permissions-on-linux).
+
+### Known device behaviour (measured, usbmon-verified)
+
+Findings from validator runs cross-checked against a bus capture and the
+firmware disassembly — expect these; they are properties of the hardware, not
+of the rig:
+
+- **Widget receive loses ~2–4 % of frames at any rate.** The DMX side is
+  clean (frame releases stay on schedule); what glitches is the EP4 IN
+  claim/arm machinery under concurrent UART-RX load, in two modes: a whole
+  stream is skipped and the firmware's unconditional triple-buffer rotation
+  overwrites the unclaimed frame (`LOST`, preceded by a ≈2×-period arrival
+  gap), or the stream stops being armed mid-frame (`RESYNC — abandoned seq N`).
+  The widget was never a lossless capture instrument; the validator counts
+  both modes but they don't indict the wire.
+- **Stale `0x42` re-delivery** (`stale42=` in the summaries): the device
+  occasionally re-arms the final packet of the frame it just delivered,
+  byte-identical, ~9 ms later. Benign — the receiver absorbs it — but its rate
+  tracks the arm-glitch behaviour above.
+- **Widget transmit keep-alive**: in transmit mode the widget re-sends its
+  committed universe every ~500 ms on its own (`dups=` in reverse summaries),
+  and its double buffer is *latest-commit-wins* — committing faster than the
+  ~23 ms wire frame silently replaces un-transmitted frames. The validator's
+  top phase is 40 Hz for exactly this reason.
+
+When capturing USB traffic for analysis, always keep the pcap and the
+validator log together — start `sudo tcpdump -i usbmon1 -s 0 -w run.pcap`
+first, then run the validator with `… cargo run 2>&1 | tee run.log`. The
+in-band sequence numbers make a lone pcap decodable, but correlating anomalies
+is mechanical only with both files from the same run.
+
+## 4G uplink watchdog
+
+The validation Pi hangs off a 4G USB dongle, and a power brownout can wedge the
+dongle's firmware so badly that only cutting its power brings it back. Since
+the dongle *is* the Pi's uplink, nobody can ssh in to fix it — recovery has to
+be automatic. `tools/4g-watchdog/` holds a watchdog that pings out over the
+dongle once a minute and, while the link stays down, walks an escalation
+ladder: restart the connection (minute 3), power-cycle the dongle's USB port
+(minute 6), reboot the Pi (minute 10, and never within 15 minutes of boot, so
+a dead SIM degrades into one reboot per boot instead of a reboot loop).
+
+### Installation on the Pi
+
+Copy the three files from `tools/4g-watchdog/` to the Pi, then place them:
+
+```sh
+sudo apt install uhubctl
+sudo install -m 0755 4g-watchdog.sh /usr/local/sbin/4g-watchdog.sh
+sudo install -m 0644 4g-watchdog.service 4g-watchdog.timer /etc/systemd/system/
+```
+
+Before enabling it, edit the configuration block at the top of
+`/usr/local/sbin/4g-watchdog.sh` to match the dongle:
+
+- `IFACE` — the dongle's interface, from `ip -br link`. QMI/MBIM modems appear
+  as `wwan0`, serial modems as `ppp0`, HiLink dongles as an extra ethernet
+  interface.
+- `UHUBCTL_LOCATION` / `UHUBCTL_PORT` — run `sudo uhubctl` and pick the hub and
+  port whose listed device is the dongle. Note that on a Pi 3B+/4 the ports
+  are ganged: the power cycle briefly cuts power to *all* USB devices,
+  including the DMX widget, which will re-enumerate.
+- `USB_DEV` — the sysfs bus path (like `1-1.2`) used as fallback when uhubctl
+  cannot switch the hub: compare `lsusb` with `ls /sys/bus/usb/devices` and
+  pick the entry whose `idVendor`/`idProduct` files match the dongle.
+
+Then enable the timer:
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable --now 4g-watchdog.timer
+```
+
+Watch it work with `journalctl -t 4g-watchdog -f`; `systemctl list-timers
+4g-watchdog.timer` confirms the once-a-minute schedule. To test the ladder end
+to end without touching the hardware, set `PING_TARGETS` to an unreachable
+address (e.g. `192.0.2.1`), let it escalate through the journal, then restore
+the real targets.
+
+### Belt and braces
+
+Two companion measures are worth taking at the same time. First, enable the
+Pi's hardware watchdog so a fully hung kernel also recovers:
+
+```sh
+sudo mkdir -p /etc/systemd/system.conf.d
+printf '[Manager]\nRuntimeWatchdogSec=15\n' | \
+    sudo tee /etc/systemd/system.conf.d/10-watchdog.conf
+sudo systemctl daemon-reexec
+```
+
+Second, chase the brownout itself: `vcgencmd get_throttled` reports non-zero
+when the 5 V rail has sagged since boot. A proper 5.1 V/3 A supply — or moving
+the dongle to a powered USB hub (a uhubctl-switchable one also removes the
+ganged-port caveat) — may stop the dongle wedging in the first place.
 
 ## Bring your own firmware
 
@@ -300,6 +405,9 @@ Confirmed and implemented:
   `Widget::start` enters transmit mode (`Mode::Transmit`), the symmetric partner
   of receive (`Mode::Receive`). Traced from the firmware.
 - LEDs are firmware-driven and autonomous (nothing for the crate to do).
+- DMX receive: `Mode::Receive` plus frame readback on endpoint `0x84`
+  (`0x40`/`0x41`/`0x42` chunk reassembly, optional start-code filter `0x04`) —
+  hardware-verified by the validator's forward run.
 - No authentication anywhere in the protocol.
 
 Open items (tracked as `TODO` in the source):
@@ -308,8 +416,8 @@ Open items (tracked as `TODO` in the source):
   one-shot vs continuous retransmit) is unconfirmed, so the send path uses `0x31`.
 - **Example transport** — the RP2040 USB host wiring, and the Embassy version
   pins.
-- **DMX receive** — `Mode::Receive` enters the firmware's receive mode, but
-  reading received frames back from the device is not yet implemented.
+- **Receive trailer** — the 4-byte trailer on the final (`0x42`) receive chunk
+  is set aside, not yet decoded (likely a byte count or timing stamp).
 - **Other modes** — stop / transmit / receive are traced; any further modes
   (e.g. RDM) are not yet explored.
 

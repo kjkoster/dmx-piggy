@@ -37,7 +37,7 @@ const MODE_COMMAND: u8 = 0x01;
 
 /// Bulk OUT endpoint that carries vendor commands — the same single live OUT
 /// endpoint the DMX chunks use (see [`crate::dmx::DEFAULT_OUT_ENDPOINT`]).
-const COMMAND_ENDPOINT: u8 = 0x02;
+pub(crate) const COMMAND_ENDPOINT: u8 = 0x02;
 
 /// The widget's operating mode, selected with the mode command.
 ///
@@ -75,10 +75,7 @@ impl<T: Transport> Widget<T> {
     /// The device boots idle and drives nothing; you must select a mode before it
     /// does anything on the DMX line.
     pub async fn set_mode(&mut self, mode: Mode) -> Result<(), Error<T::Error>> {
-        self.transport
-            .bulk_out(COMMAND_ENDPOINT, &[MODE_COMMAND, mode as u8])
-            .await
-            .map_err(Error::Transport)
+        send_mode(&mut self.transport, mode).await
     }
 
     /// Enter transmit mode — shorthand for [`set_mode`](Self::set_mode) with
@@ -105,6 +102,21 @@ impl<T: Transport> Widget<T> {
     pub fn release(self) -> T {
         self.transport
     }
+}
+
+/// Write the mode command on the command endpoint.
+///
+/// Shared by [`Widget`] (transmit) and [`crate::receive::Receiver`] (receive):
+/// the device has a single mode register that selects the RS-485 direction, so
+/// both ends drive it through this one command.
+pub(crate) async fn send_mode<T: Transport>(
+    transport: &mut T,
+    mode: Mode,
+) -> Result<(), Error<T::Error>> {
+    transport
+        .bulk_out(COMMAND_ENDPOINT, &[MODE_COMMAND, mode as u8])
+        .await
+        .map_err(Error::Transport)
 }
 
 #[cfg(test)]

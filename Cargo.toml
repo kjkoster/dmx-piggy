@@ -15,3 +15,7 @@ categories = ["embedded", "no-std", "hardware-support"]
 [dependencies]
 
 [dev-dependencies]
+
+# The examples under examples/ each declare their own `[workspace]`, so they
+# stay detached and out of `cargo test` at the root.
+[workspace]
